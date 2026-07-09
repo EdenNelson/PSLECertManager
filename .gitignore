@@ -1,0 +1,29 @@
+# Sensitive configuration files containing credentials
+Secret.psd1
+BitWardenSecrets.psd1
+*Secret*
+
+# Environment-specific configuration
+Vars.psd1
+
+# BitWarden CLI executable (binary, can be re-downloaded)
+bws.exe
+
+# CMTrace executable (binary, can be re-downloaded)
+cmtrace.exe
+
+# PowerShell module cache (can be regenerated)
+Posh-ACME/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# macOS system files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db

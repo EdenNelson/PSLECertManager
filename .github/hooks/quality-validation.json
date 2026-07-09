@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "hooks": {
+    "preToolUse": [
+      {
+        "type": "command",
+        "bash": ".github/scripts/prep-file.sh",
+        "timeoutSec": 30,
+        "cwd": "."
+      }
+    ],
+    "postToolUse": [
+      {
+        "type": "command",
+        "bash": ".github/scripts/fix-file.sh",
+        "timeoutSec": 30,
+        "cwd": "."
+      },
+      {
+        "type": "command",
+        "bash": ".github/scripts/validate-file.sh",
+        "timeoutSec": 30,
+        "cwd": ".",
+        "env": {
+          "VALIDATION_MODE": "hook"
+        }
+      }
+    ]
+  }
+}

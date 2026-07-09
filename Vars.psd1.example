@@ -1,0 +1,30 @@
+# Copy this file to Vars.psd1 and update with your values
+# Used by Update-Certificate.ps1 and Register-CertificateScheduledTask.ps1 for certificate automation
+@{
+    # Required: Domain(s) to include in the certificate (comma-separated string or array)
+    CertDomains       = "example.cascadetech.org"
+    
+    # Required: Friendly name for the certificate in the Windows certificate store
+    CertFriendlyName  = "EXAMPLE-SERVERS-NAME Let's Encrypt Certificate"
+    
+    # Required: Post-action script that receives the certificate thumbprint after issuance
+    # This script is called with -LatestCertThumbprint and optionally -UseStaging and -Verbose
+    PostScript        = "Set-ADFSCert.ps1"
+    
+    # Optional: Use Let's Encrypt staging environment for testing (default: $false)
+    # Staging issues a new certificate on every run (no renewal check)
+    # Staging certificates are not trusted; use for validation only
+    UseStaging        = $false
+    
+    # Optional: Keep generated secret files after certificate creation (default: $false)
+    # Set to $true for debugging; $false for secure cleanup
+    KeepSecrets       = $false
+    
+    # Optional: Random delay in minutes for the daily 2 AM trigger (default: 30)
+    # Staggers execution across multiple hosts to avoid simultaneous ACME requests
+    RandomDelay       = 30
+    
+    # Optional: Initial delay in minutes before first one-time execution (default: 5)
+    # Allows immediate certificate issuance after Register-CertificateScheduledTask.ps1 runs
+    InitialDelay      = 5
+}
