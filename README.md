@@ -38,7 +38,15 @@ Automated SSL/TLS certificate lifecycle management using Let's Encrypt, AWS Rout
    cd C:\Scripts\Certificates
    ```
 
-2. **Verify BitWarden CLI is installed**:
+2. **Install Posh-ACME module**:
+
+   ```powershell
+   Install-Module -Name Posh-ACME -Scope CurrentUser -Force
+   ```
+
+   Or download a specific version to the local `Posh-ACME/` directory (the script auto-detects the latest local version)
+
+3. **Verify BitWarden CLI is installed**:
 
    ```powershell
    bws.exe --version
@@ -46,7 +54,7 @@ Automated SSL/TLS certificate lifecycle management using Let's Encrypt, AWS Rout
 
    If not installed, download from [BitWarden Secrets Manager CLI](https://bitwarden.com/help/secrets-manager-cli/)
 
-3. **Ensure you have AWS Route53** DNS zone hosting the certificate domain(s)
+4. **Ensure you have AWS Route53** DNS zone hosting the certificate domain(s)
 
 ### Step 2: Configure Settings
 
@@ -69,7 +77,7 @@ Copy-Item BitWardenSecrets.psd1.example BitWardenSecrets.psd1
 
     # Required: Post-action script to run after certificate operations
     PostScript        = "Set-ADFSCert.ps1"  # Options: Set-ADFSCert.ps1, Set-WAPCert.ps1, Set-CMCMGCert.ps1, Set-NPSCert.ps1
-    
+
     # Optional: Use staging environment (issues fresh cert every run)
     UseStaging        = $false
 
