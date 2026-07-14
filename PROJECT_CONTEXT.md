@@ -1,4 +1,4 @@
-# Certificates Management Project - Context Document
+# PSLECertManager - Context Document
 
 ## Project Overview
 
@@ -8,7 +8,7 @@ This PowerShell project automates SSL/TLS certificate for Windows Servers using 
 **Author:** Eden Nelson  
 **Project Type:** PowerShell Automation Scripts  
 **Creation Date:** 2025  
-**Version**: See [VERSION](VERSION) and [CHANGELOG.md](CHANGELOG.md)
+**Version**: See [VERSION.md](VERSION.md) and [CHANGELOG.md](CHANGELOG.md)
 
 ---
 
@@ -475,7 +475,7 @@ The scripts support flexible configuration through both command-line parameters 
    PsExec.exe -s -i powershell.exe
    
    # In the SYSTEM PowerShell session:
-   cd C:\Scripts\Certificates  # or your installation path
+  cd C:\Scripts\PSLECertManager  # or your installation path
    .\Update-Certificate.ps1 -Verbose  # PostScript read from Vars.psd1
    
    # Verify Posh-ACME data location
@@ -495,8 +495,8 @@ The scripts support flexible configuration through both command-line parameters 
 ## File Structure Summary
 
 ```text
-Certificates/
-├── VERSION                                     # Project version (date-based)
+PSLECertManager/
+├── VERSION.md                                  # Project version (date-based)
 ├── CHANGELOG.md                                # Version history
 ├── Update-Certificate.ps1                      # Main orchestration script
 ├── Invoke-SecretFile.ps1                       # BitWarden secret retrieval

@@ -1,4 +1,6 @@
-# PSLECertManager - Certificate Automation with Let's Encrypt & Posh-ACME
+# PSLECertManager
+
+Certificate Automation with Let's Encrypt and Posh-ACME
 
 **Version**: See [VERSION.md](VERSION.md) and [CHANGELOG.md](CHANGELOG.md)
 
@@ -34,8 +36,8 @@ Automated SSL/TLS certificate lifecycle management using Let's Encrypt, AWS Rout
 1. **Clone or download this repository** to your Windows Server:
 
    ```powershell
-   git clone <repository-url> C:\Scripts\Certificates
-   cd C:\Scripts\Certificates
+    git clone <repository-url> C:\Scripts\PSLECertManager
+    cd C:\Scripts\PSLECertManager
    ```
 
 2. **Install Posh-ACME module**:
@@ -338,7 +340,7 @@ Example mapping:
 ## File Structure
 
 ```text
-Certificates/
+PSLECertManager/
 ├── VERSION.md                      # Project version (date-based)
 ├── CHANGELOG.md                    # Version history and changes
 ├── Update-Certificate.ps1          # Main orchestration script
