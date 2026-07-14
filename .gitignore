@@ -1,7 +1,6 @@
 # Sensitive configuration files containing credentials
 Secret.psd1
 BitWardenSecrets.psd1
-*Secret*
 
 # Environment-specific configuration
 Vars.psd1
