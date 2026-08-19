@@ -369,7 +369,7 @@ begin {
             if (Test-Path -Path $filePath) {
                 try {
                     Remove-Item -Path $filePath -Force -ErrorAction Stop
-                    Write-Log -Message "Removed secret file during $CleanupReason: $filePath"
+                    Write-Log -Message "Removed secret file during ${CleanupReason}: $filePath"
                 }
                 catch {
                     Write-Log -Message "Failed to remove stale secret file '$filePath': $_" -Level "ERROR"
@@ -424,12 +424,12 @@ begin {
             [Parameter()][switch]$UseStagingSwitch
         )
         if ($UseStagingSwitch) {
-            Set-PAServer -Name LE_STAGE
+            Set-PAServer -DirectoryUrl LE_STAGE
             Write-Log -Message "Using Let's Encrypt STAGING environment"
             Write-Verbose -Message "Using Let's Encrypt STAGING environment"
         }
         else {
-            Set-PAServer -Name LE_PROD
+            Set-PAServer -DirectoryUrl LE_PROD
             Write-Log -Message "Using Let's Encrypt PRODUCTION environment"
             Write-Verbose -Message "Using Let's Encrypt PRODUCTION environment"
         }

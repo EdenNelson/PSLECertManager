@@ -78,7 +78,7 @@ Copy-Item BitWardenSecrets.psd1.example BitWardenSecrets.psd1
     CertFriendlyName  = "SERVICE Let's Encrypt Certificate"
 
     # Required: Post-action script to run after certificate operations
-    PostScript        = "Set-ADFSCert.ps1"  # Options: Set-ADFSCert.ps1, Set-WAPCert.ps1, Set-CMCMGCert.ps1, Set-NPSCert.ps1
+    PostScript        = "Set-ADFSCert.ps1"  # Options: Set-ADFSCert.ps1, Set-WAPCert.ps1, Set-CMCMGCert.ps1, Set-NPSCert.ps1, Set-IISCert.ps1
 
     # Optional: Use staging environment (issues fresh cert every run)
     UseStaging        = $false
@@ -303,12 +303,39 @@ Example mapping:
 - PostScripts/Set-WAPCert.ps1 - Deploys to Web Application Proxy
 - PostScripts/Set-CMCMGCert.ps1 - Deploys to ConfigMgr Cloud Management Gateway
 - PostScripts/Set-NPSCert.ps1 - Deploys to Network Policy Server
+- PostScripts/Set-IISCert.ps1 - Binds the certificate to IIS HTTPS bindings
 
 **Create Custom Post-Scripts** in `PostScripts/` for:
 
-- IIS certificate binding
 - Exchange Server certificates
 - Custom application certificate deployment
+
+#### IIS Post-Script (Set-IISCert.ps1)
+
+Binds the issued certificate to IIS HTTPS bindings via `http.sys`. Binding changes take effect
+immediately; no IIS restart is required. All configuration is **optional** and self-discovered
+from a `Set-IISCert` subobject in `Vars.psd1`:
+
+| Key | Default | Purpose |
+|-----|---------|---------|
+| `Sites` | *(all sites with HTTPS bindings)* | Array of site names to target |
+| `Port` | `443` | HTTPS port to target/create |
+| `StoreName` | `My` | Certificate store the binding references |
+| `CreateBindingIfMissing` | `$false` | Create an HTTPS binding on a targeted site that has none (only for explicitly-listed `Sites`) |
+| `HostHeader` | `''` | Host header when creating a binding |
+| `IPAddress` | `*` | IP address when creating a binding |
+| `RequireSNI` | `$false` | Set the SNI flag when creating a binding |
+
+If the `Set-IISCert` subobject is omitted, the script rebinds **every existing HTTPS binding**
+on the server to the new certificate — the common case when replacing a wildcard/SAN cert that
+was used site-wide.
+
+```powershell
+# Minimal Vars.psd1 for a single IIS server:
+CertDomains      = "www.example.org"
+CertFriendlyName = "www.example.org Let's Encrypt Certificate"
+PostScript       = "Set-IISCert.ps1"
+```
 
 ## Important Considerations
 
@@ -356,7 +383,8 @@ PSLECertManager/
 │   ├── Set-ADFSCert.ps1           #   - ADFS certificate deployment
 │   ├── Set-WAPCert.ps1            #   - WAP certificate deployment
 │   ├── Set-CMCMGCert.ps1          #   - ConfigMgr CMG deployment
-│   └── Set-NPSCert.ps1            #   - NPS certificate deployment
+│   ├── Set-NPSCert.ps1            #   - NPS certificate deployment
+│   └── Set-IISCert.ps1            #   - IIS HTTPS binding deployment
 └── Posh-ACME/                      # ACME client module (local copy)
     └── */                          #   - Auto-detected version
 ```

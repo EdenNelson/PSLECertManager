@@ -57,3 +57,17 @@ and this project adheres to date-based versioning (YYYY.M.D).
 ### Security
 
 - Hardened `Initialize-Secrets` to prevent accidental exposure of sensitive data in debug logs.
+
+## [2026.7.14] - 2026-07-14
+
+### Added
+
+- `PostScripts/Set-IISCert.ps1` post-action script: binds the issued certificate to IIS HTTPS
+  bindings via http.sys (no IIS restart required). Supports staging validation-only mode and an
+  optional, self-discovered `Set-IISCert` configuration subobject in `Vars.psd1`
+  (`Sites`, `Port`, `StoreName`, `CreateBindingIfMissing`, `HostHeader`, `IPAddress`, `RequireSNI`).
+  When no config is supplied, it rebinds all existing HTTPS bindings on the server.
+
+### Changed
+
+- Documented the IIS post-script in `README.md`, `PROJECT_CONTEXT.md`, and `Vars.psd1.example`.

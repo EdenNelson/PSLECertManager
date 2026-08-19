@@ -9,6 +9,7 @@
     
     # Required: Post-action script that receives the certificate thumbprint after issuance
     # This script is called with -LatestCertThumbprint and optionally -UseStaging and -Verbose
+    # Options: Set-ADFSCert.ps1, Set-WAPCert.ps1, Set-CMCMGCert.ps1, Set-NPSCert.ps1, Set-IISCert.ps1
     PostScript        = "Set-ADFSCert.ps1"
     
     # Optional: Use Let's Encrypt staging environment for testing (default: $false)
@@ -27,4 +28,17 @@
     # Optional: Initial delay in minutes before first one-time execution (default: 5)
     # Allows immediate certificate issuance after Register-CertificateScheduledTask.ps1 runs
     InitialDelay      = 5
+
+    # Optional: Per-post-script settings, self-discovered by script basename.
+    # For Set-IISCert.ps1 ALL keys are optional. Omit this block entirely to rebind every
+    # existing HTTPS binding on the server to the new certificate.
+    # 'Set-IISCert' = @{
+    #     Sites                  = @('Default Web Site')  # omit/empty = all sites with HTTPS bindings
+    #     Port                   = 443
+    #     StoreName              = 'My'
+    #     CreateBindingIfMissing = $false
+    #     HostHeader             = ''
+    #     IPAddress              = '*'
+    #     RequireSNI             = $false
+    # }
 }

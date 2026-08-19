@@ -128,9 +128,17 @@ Located in `PostScripts/` directory. All scripts follow the same pattern:
 - Updates NPS registry configuration with new certificate thumbprint
 - Restarts Network Policy Service (IAS) to apply changes
 
+**Set-IISCert.ps1** (Internet Information Services)
+
+- Validates the certificate exists in LocalMachine\My (or the configured store)
+- Rebinds matching IIS HTTPS bindings to the new certificate thumbprint via http.sys
+- Optionally creates an HTTPS binding on an explicitly-targeted site that has none
+- Requires no IIS/service restart (http.sys picks up the change immediately)
+- Configuration is optional and self-discovered from the `Set-IISCert` subobject in Vars.psd1
+
 **Custom Post-Scripts:**
 
-- Create additional scripts in `PostScripts/` for IIS, Exchange, or other deployment targets
+- Create additional scripts in `PostScripts/` for Exchange or other deployment targets
 - Follow the same parameter pattern for consistency
 
 ---
@@ -507,7 +515,9 @@ PSLECertManager/
 ├── PostScripts/                                # Certificate deployment scripts
 │   ├── Set-ADFSCert.ps1                       #   - ADFS deployment
 │   ├── Set-WAPCert.ps1                        #   - WAP deployment
-│   └── Set-CMCMGCert.ps1                      #   - ConfigMgr CMG deployment
+│   ├── Set-CMCMGCert.ps1                      #   - ConfigMgr CMG deployment
+│   ├── Set-NPSCert.ps1                        #   - NPS deployment
+│   └── Set-IISCert.ps1                        #   - IIS HTTPS binding deployment
 ├── Posh-ACME/                                  # ACME client module (community)
 │   └── */                                      #   - Auto-detected version
 │       ├── Posh-ACME.psd1

@@ -261,7 +261,7 @@ end {
         Write-Log -Message "Scheduled task $taskName does not exist. Creating..."
         Write-Verbose -Message "Scheduled task $taskName does not exist. Creating..."
 
-        $ArgumentList = "-File `\"$scriptPath`\" -PostScript `\"$scriptValue`\""
+        $ArgumentList = "-File `"$scriptPath`" -PostScript `"$scriptValue`""
         if ($UseStaging) {
             $ArgumentList += " -UseStaging"
         }
