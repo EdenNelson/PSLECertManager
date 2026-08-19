@@ -71,3 +71,15 @@ and this project adheres to date-based versioning (YYYY.M.D).
 ### Changed
 
 - Documented the IIS post-script in `README.md`, `PROJECT_CONTEXT.md`, and `Vars.psd1.example`.
+
+
+## [2026.8.19] - 2026-08-19
+
+### Fixed
+
+- Fixed `Get-CachedCredentials` in `Update-Certificate.ps1` incorrectly demanding fresh `BitWardenSecrets.psd1` credentials whenever Posh-ACME's `cert.cer` file was missing from the cache, even when the PA account, order, and cached Route53 plugin args (`pluginargs.json`) were still present and valid (e.g. after `cert.cer`/`cert.pfx`/etc. were externally removed by AV/EDR or backup software). The script now recovers using the cached Route53 credentials from the existing order instead of failing.
+- Fixed a `$CleanupReason:` variable-reference parsing bug in `Remove-StaleSecretFiles` (same class of issue as the `$MainDomain` fix in 2026.1.20) that caused the entire script to fail to parse.
+- Fixed `Get-CachedCredentials` reporting "Cache validation PASSED" for a full PA Account + Certificate + Order hit even when the order's cached Route53 plugin args or account contact email were empty (e.g. right after the Posh-ACME account/cache was recreated following an API key rotation). The script now verifies the cached credentials are actually complete before trusting them, falling back to BitWarden otherwise.
+- Fixed `Initialize-Secrets` silently proceeding with empty cached credentials instead of validating them like the existing BitWarden path already did. An incomplete cache previously reached `New-AcmeCertificate` with an empty `$Email`, which PowerShell rejects as a non-terminating parameter-binding error - so the script logged no `[ERROR]` and simply skipped issuance while reporting a normal completion. This is now a loud, logged failure.
+- Added a hard invariant at the end of `Update-Certificate.ps1`: if a certificate was ever determined to be needed, the run can no longer exit through the quiet "No certificate update needed" branch without one actually being installed - it now logs an `[ERROR]` and throws instead, as a backstop against any future silent no-op path.
+- Fixed `BitWardenSecrets.psd1` being ignored (and then deleted by stale-file cleanup) whenever the Posh-ACME cache looked structurally complete, even if the cached Route53 credentials were actually stale (e.g. after a key rotation that cache validation can't detect, since it only checks presence, not validity). A present `BitWardenSecrets.psd1` is now treated as an explicit operator override to pull the current secret from BitWarden instead of trusting the cache.

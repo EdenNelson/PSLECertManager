@@ -180,17 +180,50 @@ begin {
         }
         
         if ($paAccountExists -and $certExists -and $existingOrder) {
-            # RENEWAL MODE: Full cache hit - all cached credentials available
-            Write-Log -Message "Cache validation PASSED: PA Account + Certificate + Order present" "INFO"
-            Write-Log -Message "Using cached credentials from Posh-ACME AppData" "INFO"
+            # Potential RENEWAL MODE: PA Account + Certificate + Order present. An order can
+            # still exist without usable cached Route53 plugin args or a contact email - e.g.
+            # right after the account/cache was recreated from scratch (new API key, cleared
+            # LE_PROD, etc.) - so verify the cache is actually complete before trusting it.
+            # Otherwise "PASSED" is misleading and New-AcmeCertificate later fails on an empty
+            # Email/R53AccessKey with a raw PowerShell parameter-binding error that is
+            # non-terminating by default, silently skipping certificate issuance.
             $cachedPluginArgs = Get-PAPluginArgs -Order $existingOrder
-            $result.usesCachedCredentials = $true
-            $result.Email = $paAccount.contact -join ','
-            $result.R53AccessKey = $cachedPluginArgs.R53AccessKey
-            $result.R53SecretKey = $cachedPluginArgs.R53SecretKey  # Already SecureString
+            $cachedEmail = $paAccount.contact -join ','
+            if ($cachedPluginArgs.R53AccessKey -and $cachedPluginArgs.R53SecretKey -and -not [string]::IsNullOrWhiteSpace($cachedEmail)) {
+                Write-Log -Message "Cache validation PASSED: PA Account + Certificate + Order present" "INFO"
+                Write-Log -Message "Using cached credentials from Posh-ACME AppData" "INFO"
+                $result.usesCachedCredentials = $true
+                $result.Email = $cachedEmail
+                $result.R53AccessKey = $cachedPluginArgs.R53AccessKey
+                $result.R53SecretKey = $cachedPluginArgs.R53SecretKey  # Already SecureString
+            } else {
+                Write-Log -Message "Cache validation PARTIAL: PA Account + Certificate + Order present but cached Route53 plugin args or account contact are incomplete for $MainDomain" "INFO"
+                Write-Log -Message "This usually means the account or order was recently recreated (e.g. after clearing the Posh-ACME cache). Will need Route53 secrets from BitWarden." "INFO"
+                $result.Email = $cachedEmail
+            }
+        } elseif ($paAccountExists -and -not $certExists -and $existingOrder) {
+            # RECOVERY MODE: PA Account + Order present, but the local certificate file
+            # (cert.cer) is missing from the Posh-ACME cache - e.g. deleted, corrupted, or
+            # quarantined by AV/EDR/backup software. Get-PACertificate only ever looks for a
+            # file literally named cert.cer, so it reports "no certificate" even though the
+            # order's cached Route53 plugin args (pluginargs.json) are still present and valid.
+            # Get-PAPluginArgs has no dependency on cert.cer, so reuse those cached credentials
+            # instead of demanding fresh secrets from BitWarden.
+            Write-Log -Message "Cache validation PARTIAL: PA Account + Order present but certificate file missing for $MainDomain" "INFO"
+            $cachedPluginArgs = Get-PAPluginArgs -Order $existingOrder
+            if ($cachedPluginArgs.R53AccessKey -and $cachedPluginArgs.R53SecretKey) {
+                Write-Log -Message "Recovering using cached Route53 plugin args from existing order (no BitWarden fetch needed)" "INFO"
+                $result.usesCachedCredentials = $true
+                $result.Email = $paAccount.contact -join ','
+                $result.R53AccessKey = $cachedPluginArgs.R53AccessKey
+                $result.R53SecretKey = $cachedPluginArgs.R53SecretKey  # Already SecureString
+            } else {
+                Write-Log -Message "Existing order found but cached plugin args are incomplete. Will need Route53 secrets from BitWarden." "INFO"
+                $result.Email = $paAccount.contact -join ','
+            }
         } elseif ($paAccountExists -and -not $certExists) {
-            # PARTIAL CACHE: PA Account exists but no cert (new domain for existing account)
-            Write-Log -Message "Cache validation PARTIAL: PA Account present but no certificate for $MainDomain" "INFO"
+            # PARTIAL CACHE: PA Account exists but no cert and no order (new domain for existing account)
+            Write-Log -Message "Cache validation PARTIAL: PA Account present but no certificate or order for $MainDomain" "INFO"
             Write-Log -Message "This is a new certificate for existing account. Will need Route53 secrets from BitWarden." "INFO"
             $result.Email = $paAccount.contact -join ','
         } else {
@@ -316,6 +349,10 @@ begin {
             Set-Variable -Name "R53AccessKey" -Value $CachedCreds.R53AccessKey -Scope Global
             Set-Variable -Name "R53SecretKey" -Value $CachedCreds.R53SecretKey -Scope Global
             Write-Log -Message "Loaded from cache: Email present=$(![string]::IsNullOrEmpty($Email)), R53AccessKey present=$(![string]::IsNullOrEmpty($R53AccessKey)), R53SecretKey present=$($null -ne $R53SecretKey)" "INFO"
+            if ([string]::IsNullOrWhiteSpace($Email) -or [string]::IsNullOrWhiteSpace($R53AccessKey) -or $null -eq $R53SecretKey) {
+                Write-Log -Message "Cached credentials were incomplete (Email/R53AccessKey/R53SecretKey missing) despite cache validation reporting a hit. Aborting before New-PACertificate would fail on a missing mandatory parameter." -Level "ERROR"
+                throw "Cached Posh-ACME credentials are incomplete; provide BitWardenSecrets.psd1 to recover"
+            }
             return $null
         }
         
@@ -424,12 +461,12 @@ begin {
             [Parameter()][switch]$UseStagingSwitch
         )
         if ($UseStagingSwitch) {
-            Set-PAServer -DirectoryUrl LE_STAGE
+            Set-PAServer -Name LE_STAGE
             Write-Log -Message "Using Let's Encrypt STAGING environment"
             Write-Verbose -Message "Using Let's Encrypt STAGING environment"
         }
         else {
-            Set-PAServer -DirectoryUrl LE_PROD
+            Set-PAServer -Name LE_PROD
             Write-Log -Message "Using Let's Encrypt PRODUCTION environment"
             Write-Verbose -Message "Using Let's Encrypt PRODUCTION environment"
         }
@@ -617,6 +654,19 @@ begin {
         
         $cachedCreds = Get-CachedCredentials -MainDomain $MainDomain -ScriptRoot $PSScriptRoot
 
+        # Explicit override: a present BitWardenSecrets.psd1 means an operator deliberately
+        # dropped it in (e.g. after rotating the Route53 API key) or a prior run failed before
+        # cleanup. Either way, cache validation can only check that credentials are PRESENT,
+        # not that they are still VALID against AWS - a rotated key still looks like a
+        # complete cache hit. Treat the file's presence as intent to bypass the cache and pull
+        # the current secret from BitWarden instead, and do this before the stale-file cleanup
+        # below so it doesn't delete the very file we're about to use.
+        $bitWardenSecretsPath = Join-Path -Path $PSScriptRoot -ChildPath "BitWardenSecrets.psd1"
+        if ($cachedCreds.usesCachedCredentials -and (Test-Path -Path $bitWardenSecretsPath)) {
+            Write-Log -Message "BitWardenSecrets.psd1 found despite a valid-looking Posh-ACME cache. Treating this as an explicit override to use current BitWarden credentials instead of the (possibly stale) cache." "INFO"
+            $cachedCreds.usesCachedCredentials = $false
+        }
+
         if ($cachedCreds.usesCachedCredentials -and -not $KeepSecrets) {
             Write-Log -Message "Cached credentials detected. Cleaning any leftover secret PSD1 files."
             Remove-StaleSecretFiles -ScriptRoot $PSScriptRoot -CleanupReason "cached-credential stale file cleanup"
@@ -645,6 +695,16 @@ begin {
         if ($certificateUpdated) {
             Invoke-PostScript -CertFriendlyName $CertFriendlyName -PostScript $PostScript -ScriptRoot $PSScriptRoot -UseStagingSwitch:$UseStaging
         }
+        elseif ($needsNewCert) {
+            # Hard invariant: if we determined a certificate was needed, we must end this run
+            # with either a certificate or a thrown/logged error - never a quiet no-op. Every
+            # known path to this point (Initialize-Secrets, New-AcmeCertificate) already throws
+            # on failure, but this is a deliberate backstop against a future change silently
+            # reintroducing a no-op path here (see the 2026-08-19 incident: an incomplete cache
+            # hit let the script report "no update needed" after silently failing to issue).
+            Write-Log -Message "Certificate issuance was needed for $MainDomain but the run completed without one being installed. Treat cached and/or BitWarden credentials as suspect." -Level "ERROR"
+            throw "Certificate update was required for $MainDomain but did not complete"
+        }
         else {
             Write-Log -Message "No certificate update needed. Skipping post-script execution."
                 Write-Log -Message ("Credentials source: {0}" -f $(if ($cachedCreds.usesCachedCredentials) { 'Posh-ACME Cache (renewal)' } else { 'BitWarden (first run or new cert)' })) "INFO"
@@ -652,172 +712,180 @@ begin {
 
         Write-Log -Message ("========== {0} Completed ==========" -f $ScriptName)
     }
-#endregion Certificate Re
+
+
+#endregion Certificate
 # SIG # Begin signature block
-# MIIfCAYJKoZIhvcNAQcCoIIe+TCCHvUCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
+# MIIgGwYJKoZIhvcNAQcCoIIgDDCCIAgCAQExCzAJBgUrDgMCGgUAMGkGCisGAQQB
 # gjcCAQSgWzBZMDQGCisGAQQBgjcCAR4wJgIDAQAABBAfzDtgWUsITrck0sYpfvNR
-# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUURTiI73LnVCya9mpwGpN4nTX
-# 0Sugghk5MIIGFDCCA/ygAwIBAgIQeiOu2lNplg+RyD5c9MfjPzANBgkqhkiG9w0B
-# AQwFADBXMQswCQYDVQQGEwJHQjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMS4w
-# LAYDVQQDEyVTZWN0aWdvIFB1YmxpYyBUaW1lIFN0YW1waW5nIFJvb3QgUjQ2MB4X
-# DTIxMDMyMjAwMDAwMFoXDTM2MDMyMTIzNTk1OVowVTELMAkGA1UEBhMCR0IxGDAW
-# BgNVBAoTD1NlY3RpZ28gTGltaXRlZDEsMCoGA1UEAxMjU2VjdGlnbyBQdWJsaWMg
-# VGltZSBTdGFtcGluZyBDQSBSMzYwggGiMA0GCSqGSIb3DQEBAQUAA4IBjwAwggGK
-# AoIBgQDNmNhDQatugivs9jN+JjTkiYzT7yISgFQ+7yavjA6Bg+OiIjPm/N/t3nC7
-# wYUrUlY3mFyI32t2o6Ft3EtxJXCc5MmZQZ8AxCbh5c6WzeJDB9qkQVa46xiYEpc8
-# 1KnBkAWgsaXnLURoYZzksHIzzCNxtIXnb9njZholGw9djnjkTdAA83abEOHQ4ujO
-# GIaBhPXG2NdV8TNgFWZ9BojlAvflxNMCOwkCnzlH4oCw5+4v1nssWeN1y4+RlaOy
-# wwRMUi54fr2vFsU5QPrgb6tSjvEUh1EC4M29YGy/SIYM8ZpHadmVjbi3Pl8hJiTW
-# w9jiCKv31pcAaeijS9fc6R7DgyyLIGflmdQMwrNRxCulVq8ZpysiSYNi79tw5RHW
-# ZUEhnRfs/hsp/fwkXsynu1jcsUX+HuG8FLa2BNheUPtOcgw+vHJcJ8HnJCrcUWhd
-# Fczf8O+pDiyGhVYX+bDDP3GhGS7TmKmGnbZ9N+MpEhWmbiAVPbgkqykSkzyYVr15
-# OApZYK8CAwEAAaOCAVwwggFYMB8GA1UdIwQYMBaAFPZ3at0//QET/xahbIICL9AK
-# PRQlMB0GA1UdDgQWBBRfWO1MMXqiYUKNUoC6s2GXGaIymzAOBgNVHQ8BAf8EBAMC
-# AYYwEgYDVR0TAQH/BAgwBgEB/wIBADATBgNVHSUEDDAKBggrBgEFBQcDCDARBgNV
-# HSAECjAIMAYGBFUdIAAwTAYDVR0fBEUwQzBBoD+gPYY7aHR0cDovL2NybC5zZWN0
-# aWdvLmNvbS9TZWN0aWdvUHVibGljVGltZVN0YW1waW5nUm9vdFI0Ni5jcmwwfAYI
-# KwYBBQUHAQEEcDBuMEcGCCsGAQUFBzAChjtodHRwOi8vY3J0LnNlY3RpZ28uY29t
-# L1NlY3RpZ29QdWJsaWNUaW1lU3RhbXBpbmdSb290UjQ2LnA3YzAjBggrBgEFBQcw
-# AYYXaHR0cDovL29jc3Auc2VjdGlnby5jb20wDQYJKoZIhvcNAQEMBQADggIBABLX
-# eyCtDjVYDJ6BHSVY/UwtZ3Svx2ImIfZVVGnGoUaGdltoX4hDskBMZx5NY5L6SCcw
-# DMZhHOmbyMhyOVJDwm1yrKYqGDHWzpwVkFJ+996jKKAXyIIaUf5JVKjccev3w16m
-# NIUlNTkpJEor7edVJZiRJVCAmWAaHcw9zP0hY3gj+fWp8MbOocI9Zn78xvm9XKGB
-# p6rEs9sEiq/pwzvg2/KjXE2yWUQIkms6+yslCRqNXPjEnBnxuUB1fm6bPAV+Tsr/
-# Qrd+mOCJemo06ldon4pJFbQd0TQVIMLv5koklInHvyaf6vATJP4DfPtKzSBPkKlO
-# tyaFTAjD2Nu+di5hErEVVaMqSVbfPzd6kNXOhYm23EWm6N2s2ZHCHVhlUgHaC4AC
-# MRCgXjYfQEDtYEK54dUwPJXV7icz0rgCzs9VI29DwsjVZFpO4ZIVR33LwXyPDbYF
-# kLqYmgHjR3tKVkhh9qKV2WCmBuC27pIOx6TYvyqiYbntinmpOqh/QPAnhDgexKG9
-# GX/n1PggkGi9HCapZp8fRwg8RftwS21Ln61euBG0yONM6noD2XQPrFwpm3GcuqJM
-# f0o8LLrFkSLRQNwxPDDkWXhW+gZswbaiie5fd/W2ygcto78XCSPfFWveUOSZ5SqK
-# 95tBO8aTHmEa4lpJVD7HrTEn9jb1EGvxOb1cnn0CMIIGMTCCBRmgAwIBAgITXQAA
-# AkSPdub9u4IuqwADAAACRDANBgkqhkiG9w0BAQsFADBaMRMwEQYKCZImiZPyLGQB
+# AgEAAgEAAgEAAgEAAgEAMCEwCQYFKw4DAhoFAAQUmoBs9BhMxQpkg8r7Yip09xAV
+# qHygghpMMIIGMTCCBRmgAwIBAgITXQAAAkSPdub9u4IuqwADAAACRDANBgkqhkiG
+# 9w0BAQsFADBaMRMwEQYKCZImiZPyLGQBGRYDb3JnMRswGQYKCZImiZPyLGQBGRYL
+# Y2FzY2FkZXRlY2gxFTATBgoJkiaJk/IsZAEZFgVpbnRyYTEPMA0GA1UEAxMGQ1RB
+# LUNBMB4XDTE3MDMyNzE4NDEwMFoXDTI3MDMyNTE4NDEwMFowbjETMBEGCgmSJomT
+# 8ixkARkWA29yZzEbMBkGCgmSJomT8ixkARkWC2Nhc2NhZGV0ZWNoMRUwEwYKCZIm
+# iZPyLGQBGRYFaW50cmExDTALBgNVBAsTBE1FU0QxFDASBgNVBAMTC0VkZW4gTmVs
+# c29uMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA6t55EHD8rTEtKnmr
+# foxUKjVUM9Eu6/4lcnLFJFaXAAGFp6HKkZoQFNgVvd4pfMYXvYV1mq/Z1PxYeACm
+# jOjVxLwtUCx3N2GX439aFtvxRX+Kc1SJ223NfPPq86dgzVupascWtmFB6srs79if
+# LXH6yqEYPiQlnfXDf2Bkomx0HcPLcqKpplsRToyLWOCGDkvovii2E+cGlaSPHE6R
+# ekyz7NioJHeqw/n7DgFxR+zHK0ekIr5It9WST6vo1eOvVSIxEA4IsVFt0KNuMt4Q
+# hwvP0msZevIklGx9AE8Ptomk9EfPUtGH0C23BuGzN5XsqaJoLclNjle4MXlMrrkZ
+# MCvkPwIDAQABo4IC2jCCAtYwPAYJKwYBBAGCNxUHBC8wLQYlKwYBBAGCNxUIgdub
+# PYHF4BGB8Y8AhveZM9LraYEKuqx8h6nAfQIBZAIBAjATBgNVHSUEDDAKBggrBgEF
+# BQcDAzAOBgNVHQ8BAf8EBAMCB4AwGwYJKwYBBAGCNxUKBA4wDDAKBggrBgEFBQcD
+# AzAdBgNVHQ4EFgQU1/EpGs3xdVYJkUujLTWDc1kWxcYwHwYDVR0jBBgwFoAURbUV
+# cNI0zRtVrM0lx4fqlrvCJZ8wggERBgNVHR8EggEIMIIBBDCCAQCggf2ggfqGgb9s
+# ZGFwOi8vL0NOPUNUQS1DQSgyKSxDTj1DVEEtREMtMDEsQ049Q0RQLENOPVB1Ymxp
+# YyUyMEtleSUyMFNlcnZpY2VzLENOPVNlcnZpY2VzLENOPUNvbmZpZ3VyYXRpb24s
+# REM9aW50cmEsREM9Y2FzY2FkZXRlY2gsREM9b3JnP2NlcnRpZmljYXRlUmV2b2Nh
+# dGlvbkxpc3Q/YmFzZT9vYmplY3RDbGFzcz1jUkxEaXN0cmlidXRpb25Qb2ludIY2
+# aHR0cDovL2N0YWNybC5jYXNjYWRldGVjaC5vcmcvQ2VydEVucm9sbC9DVEEtQ0Eo
+# MikuY3JsMIHFBggrBgEFBQcBAQSBuDCBtTCBsgYIKwYBBQUHMAKGgaVsZGFwOi8v
+# L0NOPUNUQS1DQSxDTj1BSUEsQ049UHVibGljJTIwS2V5JTIwU2VydmljZXMsQ049
+# U2VydmljZXMsQ049Q29uZmlndXJhdGlvbixEQz1pbnRyYSxEQz1jYXNjYWRldGVj
+# aCxEQz1vcmc/Y0FDZXJ0aWZpY2F0ZT9iYXNlP29iamVjdENsYXNzPWNlcnRpZmlj
+# YXRpb25BdXRob3JpdHkwNwYDVR0RBDAwLqAsBgorBgEEAYI3FAIDoB4MHG5lbHNv
+# bkBpbnRyYS5jYXNjYWRldGVjaC5vcmcwDQYJKoZIhvcNAQELBQADggEBADqKPu55
+# +4xpvtgMmdeU1pdFYz83yntNhvlf2ikI+ASsqvoVi1XDXeKcZak6lxdO7NTZ1R7I
+# KMyQWsM3/JUGTCpgaeSJwTfa7C/uDCvLXKLvsbURoQWG2bPMzno30Oy4yUKASg6Y
+# 46ibMgsIrQHnNjMhphF0gIhjKqI+XS44avQjH+78SAoI+ET0JB2qdojlg76VUpfB
+# rfhcuSVzRuRFUFwX8taI2bHRTAa6XXsFXTJsHua5gvmtF9zSvr5A+h+JJmWXNhpg
+# 579bpytyrIztoDJ2JzhkrhJl0QPZ7klj2yRcSFLGc59qfhX1kDYM8/cJxRaXRyBB
+# yr5Gl7Zg87N3+uQwggaCMIIEaqADAgECAhA2wrC9fBs656Oz3TbLyXVoMA0GCSqG
+# SIb3DQEBDAUAMIGIMQswCQYDVQQGEwJVUzETMBEGA1UECBMKTmV3IEplcnNleTEU
+# MBIGA1UEBxMLSmVyc2V5IENpdHkxHjAcBgNVBAoTFVRoZSBVU0VSVFJVU1QgTmV0
+# d29yazEuMCwGA1UEAxMlVVNFUlRydXN0IFJTQSBDZXJ0aWZpY2F0aW9uIEF1dGhv
+# cml0eTAeFw0yMTAzMjIwMDAwMDBaFw0zODAxMTgyMzU5NTlaMFcxCzAJBgNVBAYT
+# AkdCMRgwFgYDVQQKEw9TZWN0aWdvIExpbWl0ZWQxLjAsBgNVBAMTJVNlY3RpZ28g
+# UHVibGljIFRpbWUgU3RhbXBpbmcgUm9vdCBSNDYwggIiMA0GCSqGSIb3DQEBAQUA
+# A4ICDwAwggIKAoICAQCIndi5RWedHd3ouSaBmlRUwHxJBZvMWhUP2ZQQRLRBQIF3
+# FJmp1OR2LMgIU14g0JIlL6VXWKmdbmKGRDILRxEtZdQnOh2qmcxGzjqemIk8et8s
+# E6J+N+Gl1cnZocew8eCAawKLu4TRrCoqCAT8uRjDeypoGJrruH/drCio28aqIVEn
+# 45NZiZQI7YYBex48eL78lQ0BrHeSmqy1uXe9xN04aG0pKG9ki+PC6VEfzutu6Q3I
+# cZZfm00r9YAEp/4aeiLhyaKxLuhKKaAdQjRaf/h6U13jQEV1JnUTCm511n5avv4N
+# +jSVwd+Wb8UMOs4netapq5Q/yGyiQOgjsP/JRUj0MAT9YrcmXcLgsrAimfWY3MzK
+# m1HCxcquinTqbs1Q0d2VMMQyi9cAgMYC9jKc+3mW62/yVl4jnDcw6ULJsBkOkrcP
+# LUwqj7poS0T2+2JMzPP+jZ1h90/QpZnBkhdtixMiWDVgh60KmLmzXiqJc6lGwqoU
+# qpq/1HVHm+Pc2B6+wCy/GwCcjw5rmzajLbmqGygEgaj/OLoanEWP6Y52Hflef3XL
+# vYnhEY4kSirMQhtberRvaI+5YsD3XVxHGBjlIli5u+NrLedIxsE88WzKXqZjj9Zi
+# 5ybJL2WjeXuOTbswB7XjkZbErg7ebeAQUQiS/uRGZ58NHs57ZPUfECcgJC+v2wID
+# AQABo4IBFjCCARIwHwYDVR0jBBgwFoAUU3m/WqorSs9UgOHYm8Cd8rIDZsswHQYD
+# VR0OBBYEFPZ3at0//QET/xahbIICL9AKPRQlMA4GA1UdDwEB/wQEAwIBhjAPBgNV
+# HRMBAf8EBTADAQH/MBMGA1UdJQQMMAoGCCsGAQUFBwMIMBEGA1UdIAQKMAgwBgYE
+# VR0gADBQBgNVHR8ESTBHMEWgQ6BBhj9odHRwOi8vY3JsLnVzZXJ0cnVzdC5jb20v
+# VVNFUlRydXN0UlNBQ2VydGlmaWNhdGlvbkF1dGhvcml0eS5jcmwwNQYIKwYBBQUH
+# AQEEKTAnMCUGCCsGAQUFBzABhhlodHRwOi8vb2NzcC51c2VydHJ1c3QuY29tMA0G
+# CSqGSIb3DQEBDAUAA4ICAQAOvmVB7WhEuOWhxdQRh+S3OyWM637ayBeR7djxQ8Si
+# hTnLf2sABFoB0DFR6JfWS0snf6WDG2gtCGflwVvcYXZJJlFfym1Doi+4PfDP8s0c
+# qlDmdfyGOwMtGGzJ4iImyaz3IBae91g50QyrVbrUoT0mUGQHbRcF57olpfHhQESt
+# z5i6hJvVLFV/ueQ21SM99zG4W2tB1ExGL98idX8ChsTwbD/zIExAopoe3l6JrzJt
+# Pxj8V9rocAnLP2C8Q5wXVVZcbw4x4ztXLsGzqZIiRh5i111TW7HV1AtsQa6vXy63
+# 3vCAbAOIaKcLAo/IU7sClyZUk62XD0VUnHD+YvVNvIGezjM6CRpcWed/ODiptK+e
+# vDKPU2K6synimYBaNH49v9Ih24+eYXNtI38byt5kIvh+8aW88WThRpv8lUJKaPn3
+# 7+YHYafob9Rg7LyTrSYpyZoBmwRWSE4W6iPjB7wJjJpH29308ZkpKKdpkiS9WNsf
+# /eeUtvRrtIEiSJHN899L1P4l6zKVsdrUu1FX1T/ubSrsxrYJD+3f3aKg6yxdbugo
+# t06YwGXXiy5UUGZvOu3lXlxA+fC13dQ5OlL2gIb5lmF6Ii8+CQOYDwXM+yd9dbmo
+# cQsHjcRPsccUd5E9FiswEqORvz8g3s+jR3SFCgXhN4wz7NgAnOgpCdUo4uDyllU9
+# PzCCBqcwggSPoAMCAQICEQCQrAhyIP3Fp8RrXMcN9z0GMA0GCSqGSIb3DQEBDAUA
+# MFcxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0aWdvIExpbWl0ZWQxLjAsBgNV
+# BAMTJVNlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBpbmcgUm9vdCBSNDYwHhcNMjYw
+# MzI1MDAwMDAwWhcNNDEwMzI0MjM1OTU5WjBVMQswCQYDVQQGEwJHQjEYMBYGA1UE
+# ChMPU2VjdGlnbyBMaW1pdGVkMSwwKgYDVQQDEyNTZWN0aWdvIFB1YmxpYyBUaW1l
+# IFN0YW1waW5nIENBIFI0MTCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCCAgoCggIB
+# AK7kSqIBrYIcYvlmLVuaA8zw1RfBhkn4G1CoemzjcYtML6yNUvKmwGH7y6/5MuSC
+# 1UYP/+9KYDSqvMQt/1hEKHYxMAD9oZpBkoaDQFEKbOJHelsKe+BaO0ZcENTKfePc
+# raVkA7wrGAW2XHA5gQCQv4IKori/3PNOXxnDMOk8yIMgVrlMeTxqfWJ4XkjT1xc2
+# s9DD7URHWWJOFobTPoWs6mrDFlaY9FlAHDYTfbzvxQHVsvRmn3W+5ZmCwyk02I8K
+# gGPT/UX4sTz41GiR+ppwUjQXa1+2tEHZbsdAKUtH3OPEVtZvlt7atx4h83IdRR8o
+# Yi8wjY3OjFKXFecWpQbzzsPxbUKPwMWiTrzwkrFa8dH/1pDKRJt371W62PfqKPay
+# Cr/XbnBOlRn8CALSmHnRtGzuAWtTJpcT3BKw6oy8IIL6wSbu938F6ZIbRNIc1dKb
+# IJtr4ULN6R5ZfTdNEhwXctqp3RHDbg4fuOl6LjNoaFwjud92EEDhzxFJzE1jqN4c
+# sceZIwxOT1aqfsfh0uFQE/lgTBuBs3i6/WL2W1OceWLy3XEdXRK1f0EWCuea6dNf
+# X2RRdjUfk5EltFnJkN2+bWhnK14OPRKcyjOv5hKZ0iV4NRNd1+hjtva1rPyzb5Bs
+# 7EvFxqEQhgZbOq7qH3nm0rBwA0dxniBOYCFPdu246JCxAgMBAAGjggFuMIIBajAf
+# BgNVHSMEGDAWgBT2d2rdP/0BE/8WoWyCAi/QCj0UJTAdBgNVHQ4EFgQUOnSlDGfG
+# QlDC/bX8x7spNIL0erkwDgYDVR0PAQH/BAQDAgGGMBIGA1UdEwEB/wQIMAYBAf8C
+# AQAwEwYDVR0lBAwwCgYIKwYBBQUHAwgwIwYDVR0gBBwwGjAIBgZngQwBBAIwDgYM
+# KwYBBAGyMQECAQMIMEwGA1UdHwRFMEMwQaA/oD2GO2h0dHA6Ly9jcmwuc2VjdGln
+# by5jb20vU2VjdGlnb1B1YmxpY1RpbWVTdGFtcGluZ1Jvb3RSNDYuY3JsMHwGCCsG
+# AQUFBwEBBHAwbjBHBggrBgEFBQcwAoY7aHR0cDovL2NydC5zZWN0aWdvLmNvbS9T
+# ZWN0aWdvUHVibGljVGltZVN0YW1waW5nUm9vdFI0Ni5wN2MwIwYIKwYBBQUHMAGG
+# F2h0dHA6Ly9vY3NwLnNlY3RpZ28uY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAy3lJH
+# ZvGeA2b43yhzoarvobHVzbfl+RfuPDwej0wCQkYAN6scTt2GwFe22qbOCv/tllqF
+# lLKQZE+E9jVyuPTbyQHwrM7R0oLapAEDC1+CowsqSRf/ptira5Pfd4PoHICnb9co
+# PQtyZmHSQp5y9IGvqWf1qNfq7V2fHZ8DvEQrLUzeoGF9BJRYu2OzacW3QQtUum3N
+# OVf0gPRwv6I4991uhncJ6VP4lcpUpHZKB7R3hiIUC09mR9KjzPVnXHvL9n2bAwiU
+# ECfK5Zezhiw27F2tgi39DETfU8M4n0N6xLgFzsf05M5GURX8C9+IX9V6kpmmKtrU
+# zMti4LD66gtmf+mSm934K81NL6YQeMEk1rpYrWPypcW76Mir6wb1AgseLIHqn/Gk
+# euQm7zOTDf3f5WoX14qVNjZWNHF3JxkutV6ZnhinfCLfdv5bnwKWUfceqOajCVnt
+# I6uCbHxjBg6SCsexc5AfIGno7gVFvwifT4XONPsSUaJ71XsJ+EvciVUVnjOO4qxm
+# 0fWJTd8a7jP8mc4ZPqwJvQFtOp7+6G+kUJAF0fnE8YgD8uttBReNTa1YmAeFMiqc
+# 38e8fI4eLm0zjM/eeGCHasnoqqrbGwcF41iz9HXzFDwN4iD5z3QShp6HRiU3UpTw
+# DJiiXcr0z6pjl7PyzJ3/tmWtGehV7CAfc/WlyzCCBuIwggTKoAMCAQICEQDnTvJV
+# sFBP+tum3/f8i6MVMA0GCSqGSIb3DQEBDAUAMFUxCzAJBgNVBAYTAkdCMRgwFgYD
+# VQQKEw9TZWN0aWdvIExpbWl0ZWQxLDAqBgNVBAMTI1NlY3RpZ28gUHVibGljIFRp
+# bWUgU3RhbXBpbmcgQ0EgUjQxMB4XDTI2MDMyNTAwMDAwMFoXDTM3MDYyNDIzNTk1
+# OVowcjELMAkGA1UEBhMCR0IxFzAVBgNVBAgTDkdyZWF0ZXIgTG9uZG9uMRgwFgYD
+# VQQKEw9TZWN0aWdvIExpbWl0ZWQxMDAuBgNVBAMTJ1NlY3RpZ28gUHVibGljIFRp
+# bWUgU3RhbXBpbmcgU2lnbmVyIFIzNzCCAiIwDQYJKoZIhvcNAQEBBQADggIPADCC
+# AgoCggIBALL/w21L3FDZRS0FEXfZuPtUrefibnRSqOT/NNyJLOJhXjQfUspqHT+g
+# SSVgbjYThUI/cO+wFQHoOakKQNnSMKdkE8gR69ofXlkk5DAVY/ZlevliOUmlvrw2
+# Vuz4SU28rHfb/Vgd17eqpRIvJuO6XE8vPpPzn4c4iorszUF6nwuynKEQ/+rqfDmQ
+# bFNKsa+5+Z4f4kXwKdUFxUwUDjQWUhiHRwMlUWGF9N91aAvL+9a4sxCgqR/ez8W8
+# HJ/XqvSu1vIeb+J6bDFKKgkv3PJkMMpQ0BsdeXR2FejZXFRXY1w9dZe6gqyMv7px
+# +TpWbYMefECUV0WxoEMgXUk6RKcLo94uUHOdmfZu4Xe8ghglyro3/N4VEKTj8dcP
+# PvOBGxFEx1QH6uHKTkWhloGPDScurcZnd8KUtTHl6zmlQDHM04MwGfsmQViKnYEA
+# YE8RHl5XRE6GTq0ZMb59SIyJX6+CODVic/kW+dhbIS1Z5AP8HaGne/PRG+12QzSn
+# eKDJp3Ot+k4GrmmlWT9iy6FNCQ/32K+d4cAZ+Ll7uWbEn6Z6gE+tEu7MyZvzWvPN
+# sRKMkcyyflFW1zpRyzutwypALXc9Qg7sFsYERNXa58KZXqU9Onc/tck6+adQJFM9
+# tW8xOnE//P5I4eDj84IGGKqzgUD37ihC+WST3DfY0YBKWL0ZaubnAgMBAAGjggGO
+# MIIBijAfBgNVHSMEGDAWgBQ6dKUMZ8ZCUML9tfzHuyk0gvR6uTAdBgNVHQ4EFgQU
+# YRDpehKvUcSF1PLPpHQPUM0gr/gwDgYDVR0PAQH/BAQDAgbAMAwGA1UdEwEB/wQC
+# MAAwFgYDVR0lAQH/BAwwCgYIKwYBBQUHAwgwSgYDVR0gBEMwQTAIBgZngQwBBAIw
+# NQYMKwYBBAGyMQECAQMIMCUwIwYIKwYBBQUHAgEWF2h0dHBzOi8vc2VjdGlnby5j
+# b20vQ1BTMEoGA1UdHwRDMEEwP6A9oDuGOWh0dHA6Ly9jcmwuc2VjdGlnby5jb20v
+# U2VjdGlnb1B1YmxpY1RpbWVTdGFtcGluZ0NBUjQxLmNybDB6BggrBgEFBQcBAQRu
+# MGwwRQYIKwYBBQUHMAKGOWh0dHA6Ly9jcnQuc2VjdGlnby5jb20vU2VjdGlnb1B1
+# YmxpY1RpbWVTdGFtcGluZ0NBUjQxLmNydDAjBggrBgEFBQcwAYYXaHR0cDovL29j
+# c3Auc2VjdGlnby5jb20wDQYJKoZIhvcNAQEMBQADggIBAAPqPY3RrM36GXqTpsoH
+# n9TpW5I6z3dkFvc9zPL1W0Egq7j3jtnkbAvRoWeAjGX4ZK4sWsmA+u4EJG8okQmy
+# buS/4tDUI5UIQb21n4hG2vihxShrneWB0VoQ2VLQ3jCCRmRtAQ+/7H7WVKNiH5Pg
+# l4v2ZTOdPsStzpKnl1YuRrmww/+bcZmLqgk909ywIpZqAfubYfbEMYjIckLk90f2
+# mG+L8qaGSS2JJVM02pV5XltZ1fbOFETpRN/PQhwygIv33qUUjJ1fE4ITgw0McMzR
+# qziWdOJP8ocxxw7qXxz1OdRWCalyL1qvUgAFnZTVdSRiMYZKf0wLcQcM/1Xf1W4F
+# W9nff8ERX8RZJGt/TtPuMWmUpf6BCv9Q6o8YyUTtknvZRpSQ0nLttWXdtwsrN2mM
+# gfMuR//gxVrVXvDzCoK/lbiA6dEZOW53lQwBFtEzwE/FH8JdhegyYg4PymZOTZrG
+# BEvgsbxe25yEhJ0IdGa1pwCYsarldJhJVMdNcAOU7jyIMqHcczav3wtIXp/SwbXZ
+# 3xX0mfsLfANSJ47G4qPgx1atb6GIlTaQXzu/p4fTQeAIUVzZXT4K984IyfuO7NLj
+# WMtog1wGUpZD98pv+4Mt9Y5bvfPUjaUVjtePy1DVdi0rl5ESNYi0zyOmXVxtA5zz
+# xu1H7RdLZOZugT/XjX69rY9bMYIFOTCCBTUCAQEwcTBaMRMwEQYKCZImiZPyLGQB
 # GRYDb3JnMRswGQYKCZImiZPyLGQBGRYLY2FzY2FkZXRlY2gxFTATBgoJkiaJk/Is
-# ZAEZFgVpbnRyYTEPMA0GA1UEAxMGQ1RBLUNBMB4XDTE3MDMyNzE4NDEwMFoXDTI3
-# MDMyNTE4NDEwMFowbjETMBEGCgmSJomT8ixkARkWA29yZzEbMBkGCgmSJomT8ixk
-# ARkWC2Nhc2NhZGV0ZWNoMRUwEwYKCZImiZPyLGQBGRYFaW50cmExDTALBgNVBAsT
-# BE1FU0QxFDASBgNVBAMTC0VkZW4gTmVsc29uMIIBIjANBgkqhkiG9w0BAQEFAAOC
-# AQ8AMIIBCgKCAQEA6t55EHD8rTEtKnmrfoxUKjVUM9Eu6/4lcnLFJFaXAAGFp6HK
-# kZoQFNgVvd4pfMYXvYV1mq/Z1PxYeACmjOjVxLwtUCx3N2GX439aFtvxRX+Kc1SJ
-# 223NfPPq86dgzVupascWtmFB6srs79ifLXH6yqEYPiQlnfXDf2Bkomx0HcPLcqKp
-# plsRToyLWOCGDkvovii2E+cGlaSPHE6Rekyz7NioJHeqw/n7DgFxR+zHK0ekIr5I
-# t9WST6vo1eOvVSIxEA4IsVFt0KNuMt4QhwvP0msZevIklGx9AE8Ptomk9EfPUtGH
-# 0C23BuGzN5XsqaJoLclNjle4MXlMrrkZMCvkPwIDAQABo4IC2jCCAtYwPAYJKwYB
-# BAGCNxUHBC8wLQYlKwYBBAGCNxUIgdubPYHF4BGB8Y8AhveZM9LraYEKuqx8h6nA
-# fQIBZAIBAjATBgNVHSUEDDAKBggrBgEFBQcDAzAOBgNVHQ8BAf8EBAMCB4AwGwYJ
-# KwYBBAGCNxUKBA4wDDAKBggrBgEFBQcDAzAdBgNVHQ4EFgQU1/EpGs3xdVYJkUuj
-# LTWDc1kWxcYwHwYDVR0jBBgwFoAURbUVcNI0zRtVrM0lx4fqlrvCJZ8wggERBgNV
-# HR8EggEIMIIBBDCCAQCggf2ggfqGgb9sZGFwOi8vL0NOPUNUQS1DQSgyKSxDTj1D
-# VEEtREMtMDEsQ049Q0RQLENOPVB1YmxpYyUyMEtleSUyMFNlcnZpY2VzLENOPVNl
-# cnZpY2VzLENOPUNvbmZpZ3VyYXRpb24sREM9aW50cmEsREM9Y2FzY2FkZXRlY2gs
-# REM9b3JnP2NlcnRpZmljYXRlUmV2b2NhdGlvbkxpc3Q/YmFzZT9vYmplY3RDbGFz
-# cz1jUkxEaXN0cmlidXRpb25Qb2ludIY2aHR0cDovL2N0YWNybC5jYXNjYWRldGVj
-# aC5vcmcvQ2VydEVucm9sbC9DVEEtQ0EoMikuY3JsMIHFBggrBgEFBQcBAQSBuDCB
-# tTCBsgYIKwYBBQUHMAKGgaVsZGFwOi8vL0NOPUNUQS1DQSxDTj1BSUEsQ049UHVi
-# bGljJTIwS2V5JTIwU2VydmljZXMsQ049U2VydmljZXMsQ049Q29uZmlndXJhdGlv
-# bixEQz1pbnRyYSxEQz1jYXNjYWRldGVjaCxEQz1vcmc/Y0FDZXJ0aWZpY2F0ZT9i
-# YXNlP29iamVjdENsYXNzPWNlcnRpZmljYXRpb25BdXRob3JpdHkwNwYDVR0RBDAw
-# LqAsBgorBgEEAYI3FAIDoB4MHG5lbHNvbkBpbnRyYS5jYXNjYWRldGVjaC5vcmcw
-# DQYJKoZIhvcNAQELBQADggEBADqKPu55+4xpvtgMmdeU1pdFYz83yntNhvlf2ikI
-# +ASsqvoVi1XDXeKcZak6lxdO7NTZ1R7IKMyQWsM3/JUGTCpgaeSJwTfa7C/uDCvL
-# XKLvsbURoQWG2bPMzno30Oy4yUKASg6Y46ibMgsIrQHnNjMhphF0gIhjKqI+XS44
-# avQjH+78SAoI+ET0JB2qdojlg76VUpfBrfhcuSVzRuRFUFwX8taI2bHRTAa6XXsF
-# XTJsHua5gvmtF9zSvr5A+h+JJmWXNhpg579bpytyrIztoDJ2JzhkrhJl0QPZ7klj
-# 2yRcSFLGc59qfhX1kDYM8/cJxRaXRyBByr5Gl7Zg87N3+uQwggZiMIIEyqADAgEC
-# AhEApCk7bh7d16c0CIetek63JDANBgkqhkiG9w0BAQwFADBVMQswCQYDVQQGEwJH
-# QjEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMSwwKgYDVQQDEyNTZWN0aWdvIFB1
-# YmxpYyBUaW1lIFN0YW1waW5nIENBIFIzNjAeFw0yNTAzMjcwMDAwMDBaFw0zNjAz
-# MjEyMzU5NTlaMHIxCzAJBgNVBAYTAkdCMRcwFQYDVQQIEw5XZXN0IFlvcmtzaGly
-# ZTEYMBYGA1UEChMPU2VjdGlnbyBMaW1pdGVkMTAwLgYDVQQDEydTZWN0aWdvIFB1
-# YmxpYyBUaW1lIFN0YW1waW5nIFNpZ25lciBSMzYwggIiMA0GCSqGSIb3DQEBAQUA
-# A4ICDwAwggIKAoICAQDThJX0bqRTePI9EEt4Egc83JSBU2dhrJ+wY7JgReuff5KQ
-# NhMuzVytzD+iXazATVPMHZpH/kkiMo1/vlAGFrYN2P7g0Q8oPEcR3h0SftFNYxxM
-# h+bj3ZNbbYjwt8f4DsSHPT+xp9zoFuw0HOMdO3sWeA1+F8mhg6uS6BJpPwXQjNSH
-# pVTCgd1gOmKWf12HSfSbnjl3kDm0kP3aIUAhsodBYZsJA1imWqkAVqwcGfvs6pbf
-# s/0GE4BJ2aOnciKNiIV1wDRZAh7rS/O+uTQcb6JVzBVmPP63k5xcZNzGo4DOTV+s
-# M1nVrDycWEYS8bSS0lCSeclkTcPjQah9Xs7xbOBoCdmahSfg8Km8ffq8PhdoAXYK
-# OI+wlaJj+PbEuwm6rHcm24jhqQfQyYbOUFTKWFe901VdyMC4gRwRAq04FH2VTjBd
-# CkhKts5Py7H73obMGrxN1uGgVyZho4FkqXA8/uk6nkzPH9QyHIED3c9CGIJ098hU
-# 4Ig2xRjhTbengoncXUeo/cfpKXDeUcAKcuKUYRNdGDlf8WnwbyqUblj4zj1kQZSn
-# Zud5EtmjIdPLKce8UhKl5+EEJXQp1Fkc9y5Ivk4AZacGMCVG0e+wwGsjcAADRO7W
-# ga89r/jJ56IDK773LdIsL3yANVvJKdeeS6OOEiH6hpq2yT+jJ/lHa9zEdqFqMwID
-# AQABo4IBjjCCAYowHwYDVR0jBBgwFoAUX1jtTDF6omFCjVKAurNhlxmiMpswHQYD
-# VR0OBBYEFIhhjKEqN2SBKGChmzHQjP0sAs5PMA4GA1UdDwEB/wQEAwIGwDAMBgNV
-# HRMBAf8EAjAAMBYGA1UdJQEB/wQMMAoGCCsGAQUFBwMIMEoGA1UdIARDMEEwNQYM
-# KwYBBAGyMQECAQMIMCUwIwYIKwYBBQUHAgEWF2h0dHBzOi8vc2VjdGlnby5jb20v
-# Q1BTMAgGBmeBDAEEAjBKBgNVHR8EQzBBMD+gPaA7hjlodHRwOi8vY3JsLnNlY3Rp
-# Z28uY29tL1NlY3RpZ29QdWJsaWNUaW1lU3RhbXBpbmdDQVIzNi5jcmwwegYIKwYB
-# BQUHAQEEbjBsMEUGCCsGAQUFBzAChjlodHRwOi8vY3J0LnNlY3RpZ28uY29tL1Nl
-# Y3RpZ29QdWJsaWNUaW1lU3RhbXBpbmdDQVIzNi5jcnQwIwYIKwYBBQUHMAGGF2h0
-# dHA6Ly9vY3NwLnNlY3RpZ28uY29tMA0GCSqGSIb3DQEBDAUAA4IBgQACgT6khnJR
-# IfllqS49Uorh5ZvMSxNEk4SNsi7qvu+bNdcuknHgXIaZyqcVmhrV3PHcmtQKt0bl
-# v/8t8DE4bL0+H0m2tgKElpUeu6wOH02BjCIYM6HLInbNHLf6R2qHC1SUsJ02MWNq
-# RNIT6GQL0Xm3LW7E6hDZmR8jlYzhZcDdkdw0cHhXjbOLsmTeS0SeRJ1WJXEzqt25
-# dbSOaaK7vVmkEVkOHsp16ez49Bc+Ayq/Oh2BAkSTFog43ldEKgHEDBbCIyba2E8O
-# 5lPNan+BQXOLuLMKYS3ikTcp/Qw63dxyDCfgqXYUhxBpXnmeSO/WA4NwdwP35lWN
-# hmjIpNVZvhWoxDL+PxDdpph3+M5DroWGTc1ZuDa1iXmOFAK4iwTnlWDg3QNRsRa9
-# cnG3FBBpVHnHOEQj4GMkrOHdNDTbonEeGvZ+4nSZXrwCW4Wv2qyGDBLlKk3kUW1p
-# IScDCpm/chL6aUbnSsrtbepdtbCLiGanKVR/KC1gsR0tC6Q0RfWOI4owggaCMIIE
-# aqADAgECAhA2wrC9fBs656Oz3TbLyXVoMA0GCSqGSIb3DQEBDAUAMIGIMQswCQYD
-# VQQGEwJVUzETMBEGA1UECBMKTmV3IEplcnNleTEUMBIGA1UEBxMLSmVyc2V5IENp
-# dHkxHjAcBgNVBAoTFVRoZSBVU0VSVFJVU1QgTmV0d29yazEuMCwGA1UEAxMlVVNF
-# UlRydXN0IFJTQSBDZXJ0aWZpY2F0aW9uIEF1dGhvcml0eTAeFw0yMTAzMjIwMDAw
-# MDBaFw0zODAxMTgyMzU5NTlaMFcxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9TZWN0
-# aWdvIExpbWl0ZWQxLjAsBgNVBAMTJVNlY3RpZ28gUHVibGljIFRpbWUgU3RhbXBp
-# bmcgUm9vdCBSNDYwggIiMA0GCSqGSIb3DQEBAQUAA4ICDwAwggIKAoICAQCIndi5
-# RWedHd3ouSaBmlRUwHxJBZvMWhUP2ZQQRLRBQIF3FJmp1OR2LMgIU14g0JIlL6VX
-# WKmdbmKGRDILRxEtZdQnOh2qmcxGzjqemIk8et8sE6J+N+Gl1cnZocew8eCAawKL
-# u4TRrCoqCAT8uRjDeypoGJrruH/drCio28aqIVEn45NZiZQI7YYBex48eL78lQ0B
-# rHeSmqy1uXe9xN04aG0pKG9ki+PC6VEfzutu6Q3IcZZfm00r9YAEp/4aeiLhyaKx
-# LuhKKaAdQjRaf/h6U13jQEV1JnUTCm511n5avv4N+jSVwd+Wb8UMOs4netapq5Q/
-# yGyiQOgjsP/JRUj0MAT9YrcmXcLgsrAimfWY3MzKm1HCxcquinTqbs1Q0d2VMMQy
-# i9cAgMYC9jKc+3mW62/yVl4jnDcw6ULJsBkOkrcPLUwqj7poS0T2+2JMzPP+jZ1h
-# 90/QpZnBkhdtixMiWDVgh60KmLmzXiqJc6lGwqoUqpq/1HVHm+Pc2B6+wCy/GwCc
-# jw5rmzajLbmqGygEgaj/OLoanEWP6Y52Hflef3XLvYnhEY4kSirMQhtberRvaI+5
-# YsD3XVxHGBjlIli5u+NrLedIxsE88WzKXqZjj9Zi5ybJL2WjeXuOTbswB7XjkZbE
-# rg7ebeAQUQiS/uRGZ58NHs57ZPUfECcgJC+v2wIDAQABo4IBFjCCARIwHwYDVR0j
-# BBgwFoAUU3m/WqorSs9UgOHYm8Cd8rIDZsswHQYDVR0OBBYEFPZ3at0//QET/xah
-# bIICL9AKPRQlMA4GA1UdDwEB/wQEAwIBhjAPBgNVHRMBAf8EBTADAQH/MBMGA1Ud
-# JQQMMAoGCCsGAQUFBwMIMBEGA1UdIAQKMAgwBgYEVR0gADBQBgNVHR8ESTBHMEWg
-# Q6BBhj9odHRwOi8vY3JsLnVzZXJ0cnVzdC5jb20vVVNFUlRydXN0UlNBQ2VydGlm
-# aWNhdGlvbkF1dGhvcml0eS5jcmwwNQYIKwYBBQUHAQEEKTAnMCUGCCsGAQUFBzAB
-# hhlodHRwOi8vb2NzcC51c2VydHJ1c3QuY29tMA0GCSqGSIb3DQEBDAUAA4ICAQAO
-# vmVB7WhEuOWhxdQRh+S3OyWM637ayBeR7djxQ8SihTnLf2sABFoB0DFR6JfWS0sn
-# f6WDG2gtCGflwVvcYXZJJlFfym1Doi+4PfDP8s0cqlDmdfyGOwMtGGzJ4iImyaz3
-# IBae91g50QyrVbrUoT0mUGQHbRcF57olpfHhQEStz5i6hJvVLFV/ueQ21SM99zG4
-# W2tB1ExGL98idX8ChsTwbD/zIExAopoe3l6JrzJtPxj8V9rocAnLP2C8Q5wXVVZc
-# bw4x4ztXLsGzqZIiRh5i111TW7HV1AtsQa6vXy633vCAbAOIaKcLAo/IU7sClyZU
-# k62XD0VUnHD+YvVNvIGezjM6CRpcWed/ODiptK+evDKPU2K6synimYBaNH49v9Ih
-# 24+eYXNtI38byt5kIvh+8aW88WThRpv8lUJKaPn37+YHYafob9Rg7LyTrSYpyZoB
-# mwRWSE4W6iPjB7wJjJpH29308ZkpKKdpkiS9WNsf/eeUtvRrtIEiSJHN899L1P4l
-# 6zKVsdrUu1FX1T/ubSrsxrYJD+3f3aKg6yxdbugot06YwGXXiy5UUGZvOu3lXlxA
-# +fC13dQ5OlL2gIb5lmF6Ii8+CQOYDwXM+yd9dbmocQsHjcRPsccUd5E9FiswEqOR
-# vz8g3s+jR3SFCgXhN4wz7NgAnOgpCdUo4uDyllU9PzGCBTkwggU1AgEBMHEwWjET
-# MBEGCgmSJomT8ixkARkWA29yZzEbMBkGCgmSJomT8ixkARkWC2Nhc2NhZGV0ZWNo
-# MRUwEwYKCZImiZPyLGQBGRYFaW50cmExDzANBgNVBAMTBkNUQS1DQQITXQAAAkSP
-# dub9u4IuqwADAAACRDAJBgUrDgMCGgUAoHgwGAYKKwYBBAGCNwIBDDEKMAigAoAA
-# oQKAADAZBgkqhkiG9w0BCQMxDAYKKwYBBAGCNwIBBDAcBgorBgEEAYI3AgELMQ4w
-# DAYKKwYBBAGCNwIBFTAjBgkqhkiG9w0BCQQxFgQUyKsY2cZSht5DcKgCTbPJ4sl+
-# 778wDQYJKoZIhvcNAQEBBQAEggEA4+NKXaWHCQ4f7zoQB1z6KLiT5pAzSvWdVZge
-# XNeY/QfQ7DJZrKgfYEe6SoczJd9dBUI40Qr5Bb40Z9KNO3TdD2RwdpAsxFYjZRUL
-# l+cs/J5xpuSbFlyjI3A1ANKoSsxcBxcHjRluWxNEM02eTFOuEY1jGkA2blAfXnuo
-# QhTbm+q+eTf8PJyZRBR5BoVp7aMW6XKr+TQEoISA0gnkZvTCg0+dKWOaU9xwbD3i
-# 0jutfSOxuLqI4bryzOsWh2PdS6X7P3ZEYJ1bBdIOGudnpT5QeowS37g/uMkhedal
-# qCf/m5WYvCJA463WtKmIWT9fw1N0I3HmmMNaQmt1eLInytvvRKGCAyMwggMfBgkq
-# hkiG9w0BCQYxggMQMIIDDAIBATBqMFUxCzAJBgNVBAYTAkdCMRgwFgYDVQQKEw9T
-# ZWN0aWdvIExpbWl0ZWQxLDAqBgNVBAMTI1NlY3RpZ28gUHVibGljIFRpbWUgU3Rh
-# bXBpbmcgQ0EgUjM2AhEApCk7bh7d16c0CIetek63JDANBglghkgBZQMEAgIFAKB5
-# MBgGCSqGSIb3DQEJAzELBgkqhkiG9w0BBwEwHAYJKoZIhvcNAQkFMQ8XDTI2MDQy
-# NDE3NDYzMlowPwYJKoZIhvcNAQkEMTIEMNrBjZHpXue8NJ2+ZZajTEtCPqVoyE7h
-# cDqpoJvabVH/++i8LZ9h8iYBAnDmp9AVLjANBgkqhkiG9w0BAQEFAASCAgBzgDnv
-# Uw4tXDThYVG+on7kvYEvolJZJC4nmi9UrUiJiHFSN+OoSayzaoMLeZxpbh2PKE32
-# QiP/wQyd3yeISf5pFOQUHjOuEYo99l95uPUDZaVUwzMJ2p04JGjlHVFkQ72YKmLc
-# Ac0fdZdrfy8mp0WNWpfPuibLbZMPFkO/O4cUHRIFvmg4NqnB1RfiEP5kNjh+Qy/4
-# Wy/cLliaorFlQl/PGIPPB7agxWHfVRYDLJQ8viPY6UbzEVKR1WwX24xyQgB2C315
-# XWBPubs/tPEDf5N3hMbco121LZTqYCJ/uB1E+JGs9UwyVA1xN1nX1/0aB/Wl88Je
-# /OfBl8Reea8gfNGp/52577Ejb5GDsSlSklqCz8YdpcQpC4HC4noLwd9abV+dS7Gh
-# LopaDEjI31jtMMGddv9g7NEvW9ejcR0lIhoD9Y9p4m8yrBrjWR0rwhq2OYh1UdHP
-# IwenDTauyly+4xg4wyB7JpQt/p71A2cZL/HB2KWERiP9GEQc7uTvgARC1oLJyAls
-# GI9n5e+tZIRsEsIDuuHm7WyuYTrCv8BmwOpGJBXuDRpOo7N62VemXQEAFTjBJaie
-# gt3c93pNLlEegiucIiJ9p5ejeSbNuDWoVkLkiEkWb5NkwHasipuV97Q61KI1EqLs
-# GCdFg7XU9d5z8qT6L3+V3Je+quY2UscdGbtdHA==
+# ZAEZFgVpbnRyYTEPMA0GA1UEAxMGQ1RBLUNBAhNdAAACRI925v27gi6rAAMAAAJE
+# MAkGBSsOAwIaBQCgeDAYBgorBgEEAYI3AgEMMQowCKACgAChAoAAMBkGCSqGSIb3
+# DQEJAzEMBgorBgEEAYI3AgEEMBwGCisGAQQBgjcCAQsxDjAMBgorBgEEAYI3AgEV
+# MCMGCSqGSIb3DQEJBDEWBBRj13yjSFgz2aOlb/BrbaqHON591TANBgkqhkiG9w0B
+# AQEFAASCAQC/1S47Muamr6EAQyBSm0kJiP1brBuhx5aOOHfNjqX+C7TPpprsZl5K
+# WX0gSQBh7zUkIT4p7iucKA5t6FWSXVThQAZMXJjswJA9wF96ea5tANl9AGfeTfrk
+# jxW5jEEgwwOo127TL3OJacTZHCLJzyMpopKfNDhS2ASWi0srjpatHZb7JhOO5fgc
+# nnwB0P5hq2WCisMeJioFWc6mZWHsgBxRxrT1zul6RsoTsvJF1ushlxFuRAMcM6Ax
+# /0kNQ4j8T6JtQ8s/wPMXtGClJ+TGpEVjHsXWT013eV4O4AyHX9r/D46P4UvJb+Nc
+# tqYrUwMaOwYs5o8Wr7MRXGIva735/Yd2oYIDIzCCAx8GCSqGSIb3DQEJBjGCAxAw
+# ggMMAgEBMGowVTELMAkGA1UEBhMCR0IxGDAWBgNVBAoTD1NlY3RpZ28gTGltaXRl
+# ZDEsMCoGA1UEAxMjU2VjdGlnbyBQdWJsaWMgVGltZSBTdGFtcGluZyBDQSBSNDEC
+# EQDnTvJVsFBP+tum3/f8i6MVMA0GCWCGSAFlAwQCAgUAoHkwGAYJKoZIhvcNAQkD
+# MQsGCSqGSIb3DQEHATAcBgkqhkiG9w0BCQUxDxcNMjYwODE5MjEyNTAzWjA/Bgkq
+# hkiG9w0BCQQxMgQwPapx5Dinr7TEOx0MaGVxTvS6Htgc22hMPUH9LeEG3k/43zTh
+# IffKPB8Mb4OO0Wl9MA0GCSqGSIb3DQEBAQUABIICAHAhbPb3crh9HMpZ2BcsXekq
+# 3eHg1Ua80W4yyfcHAJCwxad3dZ5peuyvSykuKufw3ggLwlS8oyhuYGDqkV6URezJ
+# O+OVHLslhgA4skiYDHIh3YsRMTwq5IQCQtdAjrZM+uE6n8XdkMj9X6bgPjfkUJub
+# V7u60sEp5DxWwnQw9xRZDdaggrKQMwaT7pnvIEdmSe/kTSdcjpLCNAoNdn1TQ04w
+# xPFkBU8Klg3b8SR3ClS9ofPQvOsub/QPzu2x4d24a8I6wTSQJgqo+fFUfROmNxDF
+# d9KUksn1Frf+FMAjuDPd1QVlavVDZz1rMbouK8yRqiOFwCR6KjMwyQz+mEBG1QA0
+# rLYkh2HQhfZXF6qGiJA3GY9c6wXCW+RWLfjzKV7j4xjPP2uD6g8Q5v0Lw7EA5hKw
+# rQ4Hqk0pKrfkr8SoyDB/03vNMLz6IWiE6HnLNVmB8VTwKg7qqiEsogaM6+eJBarT
+# Xi+hbKErcLGvN99iguw4sMhCL6OlIicjdn8LGgdphf2zbNyQhnSnR4x83opDkMIi
+# 6X5A1vhiXQxxzhcdtCamocsCOyEbibjR7UXiuc+9ahGdgkaXvJXKmLmDECj4AsDs
+# zyHZCnSidzpMrpuY6WypO/hJ7Pnvpkp2sRrXU5GGuMlgbZ5tbzLdVs3E7hL+ycDU
+# qvcDdj1yndG44ecAfMcj
 # SIG # End signature block
